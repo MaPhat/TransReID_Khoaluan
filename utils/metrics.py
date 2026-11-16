@@ -89,7 +89,8 @@ def eval_func(distmat, q_pids, g_pids, q_camids, g_camids, max_rank=50):
 
 
 class R1_mAP_eval():
-    def __init__(self, num_query, max_rank=50, feat_norm=True, reranking=False, is_graph=False, is_learngraph=False, gcn_model=None):
+    def __init__(self, num_query, max_rank=50, feat_norm=True, reranking=False, is_graph=False, is_learngraph=False, gcn_model=None,
+                 use_camera=True, graph_k=20, graph_gamma=0.5):
         super(R1_mAP_eval, self).__init__()
         self.num_query = num_query
         self.max_rank = max_rank
@@ -97,8 +98,11 @@ class R1_mAP_eval():
         self.reranking = reranking
         self.is_graph = is_graph
         self.is_learngraph = is_learngraph
-        if gcn_model is not None:
-            self.gcn_model = gcn_model
+        self.gcn_model = gcn_model
+        # False for datasets without camera labels (VehicleID): A_c disabled, alpha = 1
+        self.use_camera = use_camera
+        self.graph_k = graph_k
+        self.graph_gamma = graph_gamma
 
     def reset(self):
         self.feats = []
@@ -113,6 +117,7 @@ class R1_mAP_eval():
 
     def compute(self):  # called after each epoch
         feats = torch.cat(self.feats, dim=0)
+        raw_feats = feats  # LiteGCR is applied to un-normalised features, as in training
         if self.feat_norm:
             print("The test feature is normalized")
             feats = torch.nn.functional.normalize(feats, dim=1, p=2)  # along channel
@@ -127,12 +132,15 @@ class R1_mAP_eval():
 
         if self.reranking:
             if self.is_graph:
-                if self.is_learngraph:
-                    print('=> Enter LEARNED Graph-ReRanking (GCN)')
-                    distmat = graph_reranking(qf, gf, q_camids, g_camids, k=20, learn_based=True, gcn_model=self.gcn_model)
+                if self.is_learngraph and self.gcn_model is not None:
+                    print('=> Enter LEARNED Graph-ReRanking (LiteGCR)')
+                    distmat = graph_reranking(raw_feats[:self.num_query], raw_feats[self.num_query:],
+                                              q_camids, g_camids, k=self.graph_k, gamma=self.graph_gamma,
+                                              gcn_model=self.gcn_model, use_camera=self.use_camera)
                 else:
-                    print('=> Enter graph-reranking')
-                    distmat = graph_reranking(qf, gf, q_camids, g_camids, k=20, learn_based=False)
+                    print('=> Enter rule-based graph-reranking')
+                    distmat = graph_reranking(qf, gf, q_camids, g_camids, k=self.graph_k, gamma=self.graph_gamma,
+                                              gcn_model=None, use_camera=self.use_camera)
             else:
                 print('=> Enter K-reciprocal reranking')
                 distmat = re_ranking(qf, gf, k1=20, k2=6, lambda_value=0.3)

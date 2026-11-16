@@ -70,6 +70,9 @@ _C.MODEL.SIE_VIEW = False
 
 # Graph_Based learning
 _C.MODEL.LEARN_BASED_GCN = False
+# LiteGCR graph construction (shared by training batches and test-time graph)
+_C.MODEL.GCN_K = 20
+_C.MODEL.GCN_GAMMA = 0.5
 
 # -----------------------------------------------------------------------------
 # INPUT

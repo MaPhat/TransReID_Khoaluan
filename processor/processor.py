@@ -5,8 +5,27 @@ import torch
 import torch.nn as nn
 from utils.meter import AverageMeter
 from utils.metrics import R1_mAP_eval
+from utils.graph_reranking import build_graphs
 from torch.cuda import amp
 import torch.distributed as dist
+
+def has_camera_labels(cfg):
+    """VehicleID provides no camera labels: LiteGCR cross-camera branch is disabled."""
+    return cfg.DATASETS.NAMES != 'VehicleID'
+
+
+def make_evaluator(cfg, num_query, gcn_model=None):
+    use_gcn = gcn_model is not None and cfg.MODEL.LEARN_BASED_GCN
+    return R1_mAP_eval(num_query, max_rank=50,
+                       feat_norm=cfg.TEST.FEAT_NORM,
+                       reranking=cfg.TEST.RE_RANKING,
+                       is_graph=cfg.TEST.GRAPH_RE_RANKING,
+                       is_learngraph=use_gcn,
+                       gcn_model=gcn_model if use_gcn else None,
+                       use_camera=has_camera_labels(cfg),
+                       graph_k=cfg.MODEL.GCN_K,
+                       graph_gamma=cfg.MODEL.GCN_GAMMA)
+
 
 def do_train(cfg,
              model,
@@ -39,18 +58,8 @@ def do_train(cfg,
     loss_meter = AverageMeter()
     acc_meter = AverageMeter()
 
-    if gcn_model is not None:
-        evaluator = R1_mAP_eval(num_query, max_rank=50, 
-                                feat_norm=cfg.TEST.FEAT_NORM, 
-                                reranking=cfg.TEST.RE_RANKING, 
-                                is_graph=cfg.TEST.GRAPH_RE_RANKING,
-                                is_learngraph=cfg.MODEL.LEARN_BASED_GCN,
-                                gcn_model=gcn_model)
-    else:
-        evaluator = R1_mAP_eval(num_query, max_rank=50, 
-                                feat_norm=cfg.TEST.FEAT_NORM, 
-                                reranking=cfg.TEST.RE_RANKING, 
-                                is_graph=cfg.TEST.GRAPH_RE_RANKING)
+    evaluator = make_evaluator(cfg, num_query, gcn_model)
+    use_camera = has_camera_labels(cfg)
     scaler = amp.GradScaler()
 
     # Early stopping state
@@ -66,6 +75,8 @@ def do_train(cfg,
         evaluator.reset()
         scheduler.step(epoch)
         model.train()
+        if gcn_model is not None:
+            gcn_model.train()
         for n_iter, (img, vid, target_cam, target_view) in enumerate(train_loader):
             optimizer.zero_grad()
             optimizer_center.zero_grad()
@@ -78,7 +89,9 @@ def do_train(cfg,
                 if cfg.MODEL.LEARN_BASED_GCN:
                     feat_is_list = isinstance(feat, list)
                     global_feature = feat[0] if feat_is_list else feat
-                    A_g, A_c = build_graphs_for_batch(global_feature, target_cam)
+                    A_g, A_c = build_graphs(global_feature,
+                                            target_cam if use_camera else None,
+                                            k=cfg.MODEL.GCN_K, gamma=cfg.MODEL.GCN_GAMMA)
                     global_feature_gcn = gcn_model(global_feature, A_g, A_c)
 
                     if feat_is_list:
@@ -210,18 +223,7 @@ def do_inference(cfg,
     logger = logging.getLogger("transreid.test")
     logger.info("Enter inferencing")
 
-    if gcn_model is not None and cfg.MODEL.LEARN_BASED_GCN:
-        evaluator = R1_mAP_eval(num_query, max_rank=50, 
-                            feat_norm=cfg.TEST.FEAT_NORM, 
-                            reranking=cfg.TEST.RE_RANKING, 
-                            is_graph=cfg.TEST.GRAPH_RE_RANKING,
-                            is_learngraph=cfg.MODEL.LEARN_BASED_GCN,
-                            gcn_model=gcn_model)
-    else:
-        evaluator = R1_mAP_eval(num_query, max_rank=50, 
-                            feat_norm=cfg.TEST.FEAT_NORM, 
-                            reranking=cfg.TEST.RE_RANKING, 
-                            is_graph=cfg.TEST.GRAPH_RE_RANKING)
+    evaluator = make_evaluator(cfg, num_query, gcn_model)
 
     evaluator.reset()
 
@@ -249,37 +251,3 @@ def do_inference(cfg,
     for r in [1, 5, 10]:
         logger.info("CMC curve, Rank-{:<3}:{:.1%}".format(r, cmc[r - 1]))
     return mAP, cmc[0], cmc[4], cmc[9]
-
-def build_graphs_for_batch(feat, camids, k=5, gamma=2.0):
-    """
-    Xây dựng đồ thị động cho một Batch huấn luyện.
-    feat: (N, D) - Đặc trưng trích xuất từ Backbone
-    camids: (N,) - ID camera của từng ảnh trong batch
-    k: Số lượng lân cận gần nhất
-    """
-    # feat = torch.Tensor(feat)
-    if feat.dim() == 1:
-        feat = feat.unsqueeze(0)
-    N = feat.size(0)
-    device = feat.device
-    k = min(k, N)
-
-    dist_mat = torch.cdist(feat, feat, p=2)
-
-    _, nn_idx = torch.topk(dist_mat, k=k, largest=False)
-    
-    A_g = torch.zeros(N, N, device=device)
-    weights = torch.exp(-dist_mat / gamma)
-    A_g.scatter_(1, nn_idx, weights.gather(1, nn_idx))
-
-    camids = camids.view(-1, 1)
-    mask_cross = (camids != camids.T).float()
-    
-    A_c = A_g * mask_cross
-
-    def normalize(A):
-        row_sum = A.sum(1, keepdim=True)
-        A_norm = A / (row_sum + 1e-6)
-        return A_norm
-
-    return normalize(A_g), normalize(A_c)

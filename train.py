@@ -68,14 +68,16 @@ if __name__ == '__main__':
 
     model = make_model(cfg, num_class=num_classes, camera_num=camera_num, view_num = view_num)
 
-    feature_dim = model.in_planes 
-    gcn_model = GCNRefiner(feature_dim=feature_dim).cuda()
+    gcn_model = None
+    if cfg.MODEL.LEARN_BASED_GCN:
+        gcn_model = GCNRefiner(feature_dim=model.in_planes).cuda()
 
     loss_func, center_criterion = make_loss(cfg, num_classes=num_classes)
 
     optimizer, optimizer_center = make_optimizer(cfg, model, center_criterion)
     # Thêm param của gcn_model
-    optimizer.add_param_group({'params': gcn_model.parameters(), 'lr': cfg.SOLVER.BASE_LR})
+    if gcn_model is not None:
+        optimizer.add_param_group({'params': gcn_model.parameters(), 'lr': cfg.SOLVER.BASE_LR})
     scheduler = create_scheduler(cfg, optimizer)
 
     do_train(
