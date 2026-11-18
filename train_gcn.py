@@ -19,17 +19,18 @@ from datasets import make_dataloader
 from loss.softmax_loss import CrossEntropyLabelSmooth
 from loss.triplet_loss import TripletLoss
 from model import make_model
-from utils.gcn_stage2 import evaluate_rows, train_gcn_on_features
+from utils.gcn_stage2 import evaluate_rows, log_progress, train_gcn_on_features
 from utils.logger import setup_logger
 from utils.metrics import eval_func
 from utils.reranking import re_ranking
 
 
 @torch.no_grad()
-def extract(model, loader, device):
+def extract(model, loader, device, desc, amp=False, log=print):
     feats, pids, cams = [], [], []
-    for img, pid, camid, camids, view, _ in loader:
-        feat = model(img.to(device), cam_label=camids.to(device), view_label=view.to(device))
+    for img, pid, camid, camids, view, _ in log_progress(loader, desc, log):
+        with torch.autocast('cuda', dtype=torch.float16, enabled=amp and device == 'cuda'):
+            feat = model(img.to(device), cam_label=camids.to(device), view_label=view.to(device))
         feats.append(feat.float().cpu())
         pids.extend(pid)
         cams.extend(camid)
@@ -45,6 +46,7 @@ if __name__ == '__main__':
     parser.add_argument('--P', default=64, type=int, help='identities per batch')
     parser.add_argument('--K', default=4, type=int, help='images per identity')
     parser.add_argument('--lr', default=1e-3, type=float)
+    parser.add_argument('--no_amp', action='store_true', help='extract train features in FP32 (slower)')
     parser.add_argument('--eval_only', action='store_true', help='quick test from cached features, no training')
     parser.add_argument('--gcn_weights', default=None, help='GCN weights for --eval_only (default: <out_dir>/gcn_best.pth)')
     parser.add_argument('opts', default=None, nargs=argparse.REMAINDER)
@@ -58,6 +60,7 @@ if __name__ == '__main__':
     logger = setup_logger('transreid', args.out_dir, if_train=False)
     os.environ['CUDA_VISIBLE_DEVICES'] = cfg.MODEL.DEVICE_ID
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    torch.backends.cudnn.benchmark = True
     random.seed(cfg.SOLVER.SEED); np.random.seed(cfg.SOLVER.SEED); torch.manual_seed(cfg.SOLVER.SEED)
 
     cache = os.path.join(args.out_dir, 'features.pt')
@@ -71,10 +74,10 @@ if __name__ == '__main__':
         model.to(device).eval()
         feat_dim = model.in_planes
         logger.info('Extracting train features ...')
-        tf, tp, tc = extract(model, train_loader_normal, device)
+        tf, tp, tc = extract(model, train_loader_normal, device, 'train feats', amp=not args.no_amp, log=logger.info)
         logger.info('Extracting query/gallery features ...')
-        vf, vp, vc = extract(model, val_loader, device)
-        d = dict(train_feats=tf.half(), train_pids=tp, train_cams=tc,
+        vf, vp, vc = extract(model, val_loader, device, 'query+gallery feats', log=logger.info)
+        d = dict(train_feats=tf[:, :feat_dim].half(), train_pids=tp, train_cams=tc,
                  q_desc=vf[:num_query], g_desc=vf[num_query:], q_pids=vp[:num_query], g_pids=vp[num_query:],
                  q_cams=vc[:num_query], g_cams=vc[num_query:], feat_dim=feat_dim, num_classes=num_classes)
         torch.save(d, cache)

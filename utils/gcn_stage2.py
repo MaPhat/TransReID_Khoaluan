@@ -27,6 +27,20 @@ except ImportError:  # TransReID / RPTM layout
     from utils.graph_reranking import GCNRefiner, build_graphs, graph_reranking
 
 
+def log_progress(loader, desc, log=print, every=30.0):
+    """Iterate a DataLoader and log throughput + ETA every `every` seconds (and on the first batch)."""
+    total, bs = len(loader), getattr(loader, 'batch_size', None) or 1
+    t0 = last = time.time()
+    for i, batch in enumerate(loader, 1):
+        yield batch
+        now = time.time()
+        if i == 1 or i == total or now - last >= every:
+            rate = i / (now - t0)
+            log(f'[{desc}] {i}/{total} batches ({100 * i / total:.0f}%) | {rate * bs:.0f} img/s | '
+                f'ETA {(total - i) / rate / 60:.1f} min')
+            last = now
+
+
 class IDHead(nn.Module):
     """BNNeck + linear classifier (same design as the ReID baselines)."""
 
@@ -52,12 +66,14 @@ def pk_indices(pid_to_idx, pids, P, K, rng):
 
 
 def prepare_descriptor(x, dim, normalize_rest):
-    """Descriptor as the plain (no graph) pipeline uses it: global part L2-normalised, rest kept/normalised."""
+    """Descriptor as the plain (no graph) pipeline uses it.
+    normalize_rest=True  (TransReID / RPTM): the WHOLE descriptor is L2-normalised (also with JPM local parts).
+    normalize_rest=False (MBR): global part normalised, the other branches are already normalised."""
     x = x.float()
+    if normalize_rest:
+        return F.normalize(x, p=2, dim=1)
     g = F.normalize(x[:, :dim], p=2, dim=1)
     r = x[:, dim:]
-    if r.numel() and normalize_rest:
-        r = F.normalize(r, p=2, dim=1)
     return torch.cat([g, r], 1) if r.numel() else g
 
 
